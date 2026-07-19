@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/*.csv
+.DS_Store
+.streamlit/secrets.toml
+artifacts/
+*.pt
+*.pth
+*.ckpt
+.env
+.cache/
+.ipynb_checkpoints/
+*.log
+.pytest_cache/
