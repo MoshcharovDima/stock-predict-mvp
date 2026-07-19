@@ -6,7 +6,7 @@ data/*.csv
 .DS_Store
 .streamlit/secrets.toml
 #artifacts/
-*.pt
+#.pt
 *.pth
 *.ckpt
 .env
