@@ -5,7 +5,7 @@ venv/
 data/*.csv
 .DS_Store
 .streamlit/secrets.toml
-artifacts/
+#artifacts/
 *.pt
 *.pth
 *.ckpt
