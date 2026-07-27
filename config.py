@@ -26,8 +26,14 @@ END_DATE    = TODAY.isoformat()
 TRAIN_FRAC = 0.70
 VAL_FRAC   = 0.15   # test = остаток
 
+# Постановка задачи
+# True  — таргет log(Close_{T+1}/Close_T), признаки безразмерные
+#         (см. src/data/prices.py::make_stationary)
+# False — прогноз уровня цены
+STATIONARY_FEATURES = True
+
 # Целевая переменная
-TARGET_COL   = 'target'   # Close следующего торгового дня
+TARGET_COL   = 'target'
 TARGET_SHIFT = -1
 
 # Признаки

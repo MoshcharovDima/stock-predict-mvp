@@ -44,11 +44,15 @@ def build_raw_dataset(ticker: str,
     sent_daily, emb_daily = daily_sentiment_frame(
         df_news, show_progress=show_progress)
 
-    #  выравнивание на все торговые дни 
-    sent_daily = sent_daily.reindex(trading_index).ffill().bfill()
+    # Выравнивание на все торговые дни: только ffill, без bfill —
+    # обратное заполнение принесло бы в день T тональность новостей,
+    # вышедших позже (look-ahead-утечка).
+    sent_daily = sent_daily.reindex(trading_index).ffill()
     for col, val in NEUTRAL_SENTIMENT.items():
         sent_daily[col] = sent_daily[col].fillna(val)
 
-    emb_daily = emb_daily.reindex(trading_index).ffill().bfill().fillna(0.0)
+    # Дни до первой новости остаются NaN: заполнить их можно только
+    # значением из будущего, поэтому train.py отбрасывает этот участок.
+    emb_daily = emb_daily.reindex(trading_index).ffill()
 
     return df_prices, sent_daily[SENTIMENT_FEATURES], emb_daily

@@ -5,6 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -92,18 +93,28 @@ c3.metric('Новостной фон сегодня', f'{score:+.3f}',
           else ('негативный' if score < -0.02 else 'нейтральный'),
           delta_color='normal' if score > 0.02
           else ('inverse' if score < -0.02 else 'off'))
-c4.metric('MAPE на тесте', f'{res["meta"]["metrics_test"]["MAPE"]:.2f}%',
+_mape = res['meta']['metrics_test']['MAPE']
+_mape_naive = res['meta']['metrics_naive']['MAPE']
+c4.metric('MAPE на тесте', f'{_mape:.2f}%',
+          delta=f'{_mape - _mape_naive:+.2f} п.п. к наивному',
+          delta_color='inverse',
           help='Средняя абсолютная процентная ошибка на отложенном '
-               'тестовом периоде')
+               'тестовом периоде. Для сравнения приведена разница с '
+               'наивным прогнозом «завтра = сегодня»: отрицательная '
+               'величина означает, что модель точнее.')
 
 # График: окно 20 дней + прогнозная точка
 window = res['window']
+# в модель идут стационарные признаки, для графика — сырые цены raw_*
 fig = go.Figure()
 fig.add_trace(go.Candlestick(
-    x=window.index, open=window['Open'], high=window['High'],
-    low=window['Low'], close=window['Close'], name='OHLC'))
+    x=window.index, open=window['raw_Open'], high=window['raw_High'],
+    low=window['raw_Low'], close=window['raw_Close'], name='OHLC'))
+
+# признак MA_20 хранится как log(Close / MA_20) → возвращаем уровень
+ma20 = window['raw_Close'] / np.exp(window['MA_20'])
 fig.add_trace(go.Scatter(
-    x=window.index, y=window['MA_20'], name='MA 20',
+    x=window.index, y=ma20, name='MA 20',
     line=dict(color='#FF9800', width=1.5, dash='dash')))
 fig.add_trace(go.Scatter(
     x=[pd.Timestamp(res['predicted_date'])], y=[res['predicted_close']],
@@ -145,10 +156,27 @@ with col_model:
     st.subheader('🎯 Качество модели (тестовый период)')
     meta = res['meta']
     m, nv = meta['metrics_test'], meta['metrics_naive']
-    st.dataframe(pd.DataFrame({
+    table = pd.DataFrame({
         'Гибридная LSTM': m,
-        'Наивный прогноз (T=T-1)': nv,
-    }).T.style.format('{:.2f}'), use_container_width=True)
+        'Наивный прогноз («завтра = сегодня»)': nv,
+    }).T
+    # DA наивного прогноза не определён — в таблице прочерк
+    st.dataframe(
+        table.style.format(lambda v: '—' if v is None or pd.isna(v)
+                           else f'{v:.2f}'),
+        use_container_width=True)
+    ss = meta.get('seed_summary')
+    if ss and len(meta.get('seeds', [])) > 1:
+        st.caption(
+            f'Разброс по {len(meta["seeds"])} сидам: '
+            f'MAE {ss["MAE"]["mean"]:.2f} ± {ss["MAE"]["std"]:.2f}, '
+            f'DA {ss["DA"]["mean"]:.1f} ± {ss["DA"]["std"]:.1f}%. '
+            f'В артефакты сохранён лучший по валидации.')
+
+    if meta.get('baseline_up_share') is not None:
+        st.caption(f'Доля растущих дней на тесте: '
+                   f'{meta["baseline_up_share"]:.1f}% — это DA стратегии '
+                   f'«всегда вверх», с ней и нужно сравнивать DA модели.')
     st.caption(
         f'Обучена {meta["trained_at"][:10]} на данных '
         f'{meta["period"][0]} → {meta["period"][1]} '
@@ -163,8 +191,13 @@ with col_model:
         fig2.add_trace(go.Scatter(x=dfp['date'], y=dfp['y_true'],
                                   name='Факт', line=dict(color='#1565C0')))
         fig2.add_trace(go.Scatter(x=dfp['date'], y=dfp['y_pred'],
-                                  name='Прогноз',
+                                  name='Прогноз модели',
                                   line=dict(color='#7B1FA2', dash='dot')))
+        if 'close_today' in dfp.columns:
+            fig2.add_trace(go.Scatter(
+                x=dfp['date'], y=dfp['close_today'],
+                name='Наивный («завтра = сегодня»)',
+                line=dict(color='#9E9E9E', dash='dash', width=1)))
         fig2.update_layout(height=280,
                            margin=dict(l=10, r=10, t=30, b=10),
                            title='Факт vs прогноз на тесте',

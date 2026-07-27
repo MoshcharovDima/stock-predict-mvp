@@ -17,9 +17,9 @@ import torch
 import src.train as train_mod
 from config import (
     ARTIFACT_DIR, LOOK_BACK, PRICE_FEATURES, EMBEDDING_FEATURES,
-    SENTIMENT_FEATURES, TARGET_COL,
+    SENTIMENT_FEATURES, STATIONARY_FEATURES, TARGET_COL,
 )
-from src.data.prices import add_indicators
+from src.data.prices import add_indicators, make_stationary
 from src.predict import load_artifacts
 from src.models.hybrid_lstm import split_streams
 
@@ -45,7 +45,13 @@ def make_synthetic_data(n_days: int = 320, seed: int = 0):
                        'Close': close, 'Volume': vol}, index=dates)
     df.index.name = 'date'
     df = add_indicators(df)
-    df[TARGET_COL] = df['Close'].shift(-1)
+    if STATIONARY_FEATURES:
+        df = make_stationary(df)
+        df[TARGET_COL] = np.log(df['raw_Close'].shift(-1) / df['raw_Close'])
+    else:
+        for c in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[f'raw_{c}'] = df[c]
+        df[TARGET_COL] = df['Close'].shift(-1)
     df = df.dropna(subset=PRICE_FEATURES)
 
     sent = pd.DataFrame(
@@ -66,8 +72,19 @@ def test_train_smoke(tmp_run: bool = True):
     # ускоряем обучение
     train_mod.EPOCHS, train_mod.PATIENCE = 6, 3
 
-    metrics = train_mod.train_ticker(TICKER)
+    metrics = train_mod.train_ticker(TICKER, seeds=[0, 1])
     assert set(metrics) == {'MAE', 'RMSE', 'MAPE', 'DA'}
+
+    # Синтетика — random walk, предсказать его нельзя, поэтому наивный
+    # прогноз близок к оптимуму и модель обязана быть с ним одного
+    # порядка. Проигрыш в разы означает, что прогноз упирается
+    # в границы train-диапазона.
+    import json
+    meta = json.load(open(os.path.join(ARTIFACT_DIR, TICKER, 'meta.json')))
+    naive_mae = meta['metrics_naive']['MAE']
+    assert metrics['MAE'] < naive_mae * 2.0, (
+        f'Модель в {metrics["MAE"] / naive_mae:.1f} раза хуже наивного '
+        f'прогноза — вероятен срез экстраполяции или утечка масштаба')
 
     # артефакты загружаются и делают прогноз
     art = load_artifacts(TICKER)

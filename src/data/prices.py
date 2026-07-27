@@ -4,10 +4,13 @@
 import io
 import time
 
+import numpy as np
 import pandas as pd
 import ta
 
-from config import PRICE_FEATURES, TARGET_COL, TARGET_SHIFT
+from config import (
+    PRICE_FEATURES, STATIONARY_FEATURES, TARGET_COL, TARGET_SHIFT,
+)
 
 OHLCV = ['Open', 'High', 'Low', 'Close', 'Volume']
 
@@ -58,7 +61,11 @@ def _from_yfinance(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 def download_prices(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """Скачивает OHLCV: сначала Stooq, при отказе — yfinance."""
+    """
+    Скачивает OHLCV: основной источник — yfinance (auto_adjust=True),
+    запасной — Stooq (без корректировки на сплиты и дивиденды).
+    Источник пишется в df.attrs['source'] и сверяется при инференсе.
+    """
     try:
         df = _from_yfinance(ticker, start, end)
         source = 'yfinance'
@@ -76,6 +83,7 @@ def download_prices(ticker: str, start: str, end: str) -> pd.DataFrame:
     df = df[OHLCV].dropna()
     if df.empty:
         raise RuntimeError(f'Не удалось получить цены для {ticker}')
+    df.attrs['source'] = source
     print(f'  Цены {ticker}: {len(df)} строк '
           f'({df.index[0].date()} → {df.index[-1].date()}) [{source}]')
     return df
@@ -123,17 +131,83 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+RAW_COLS = ['raw_Open', 'raw_High', 'raw_Low', 'raw_Close', 'raw_Volume']
+
+
+def make_stationary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Переводит признаки уровня цены в стационарные (безразмерные) аналоги.
+    Цена — нестационарный ряд с трендом, поэтому её уровень не подаётся
+    в модель напрямую. Имена и число признаков (27) сохраняются:
+
+      · Open/High/Low/Close  → лог-доходность к вчерашнему закрытию
+      · Volume               → лог-отношение к среднему объёму за 20 дней
+      · MA_*/EMA_*/BB_*      → лог-отношение цены к уровню индикатора
+      · MACD*/MOM/ATR        → нормировка на цену закрытия
+      · OBV                  → дневное изменение, нормированное на объём
+      · RSI/ROC/CCI/Williams_R/Stoch_*/ADX/BB_width — уже стационарны
+
+    Сырые цены остаются в колонках raw_*: они нужны для восстановления
+    прогноза в долларах, наивного бенчмарка и свечного графика.
+    """
+    df = df.copy()
+
+    for c in OHLCV:
+        df[f'raw_{c}'] = df[c]
+
+    close = df['raw_Close']
+    prev_close = close.shift(1)
+    vol_ma = df['raw_Volume'].rolling(20).mean()
+
+    # OHLC → лог-доходности относительно предыдущего закрытия
+    for c in ['Open', 'High', 'Low', 'Close']:
+        df[c] = np.log(df[f'raw_{c}'] / prev_close)
+
+    # объём → относительная активность
+    df['Volume'] = np.log(df['raw_Volume'] / vol_ma)
+
+    # скользящие средние и полосы Боллинджера → отклонение цены от уровня
+
+    for c in ['MA_5', 'MA_20', 'MA_50', 'EMA_12', 'EMA_26',
+              'BB_upper', 'BB_middle', 'BB_lower']:
+        df[c] = np.log(close / df[c])
+
+    # признаки в единицах цены → доля от цены
+    for c in ['MACD', 'MACD_signal', 'MACD_hist', 'MOM', 'ATR']:
+        df[c] = df[c] / close
+
+    # OBV — накопленная сумма, берём приращение и нормируем на объём
+    df['OBV'] = df['OBV'].diff() / vol_ma
+
+    df = df.replace([np.inf, -np.inf], np.nan)
+    return df
+
+
 def build_price_frame(ticker: str, start: str, end: str,
                       with_target: bool = True) -> pd.DataFrame:
     """
     Полный ценовой датафрейм: OHLCV + индикаторы (+ target для обучения).
     NaN от прогрева индикаторов удаляются.
+
+    При STATIONARY_FEATURES=True признаки стационаризуются, а таргет —
+    лог-доходность следующего дня: log(Close_{T+1} / Close_T).
+    Цена восстанавливается как Close_T * exp(prediction).
     """
     df = download_prices(ticker, start, end)
+    source = df.attrs.get('source', 'unknown')
     df = add_indicators(df)
 
-    if with_target:
-        df[TARGET_COL] = df['Close'].shift(TARGET_SHIFT)
+    if STATIONARY_FEATURES:
+        df = make_stationary(df)
+        if with_target:
+            df[TARGET_COL] = (np.log(df['raw_Close'].shift(TARGET_SHIFT)
+                                     / df['raw_Close']))
+    else:
+        for c in OHLCV:
+            df[f'raw_{c}'] = df[c]
+        if with_target:
+            df[TARGET_COL] = df['Close'].shift(TARGET_SHIFT)
 
     df = df.dropna(subset=PRICE_FEATURES)
+    df.attrs['source'] = source
     return df

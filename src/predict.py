@@ -13,10 +13,11 @@ import torch
 
 from config import (
     ARTIFACT_DIR, DEVICE, EMBEDDING_FEATURES, LOOK_BACK,
-    PRICE_FEATURES, SENTIMENT_FEATURES, WARMUP_DAYS,
+    PRICE_FEATURES, SENTIMENT_FEATURES, STATIONARY_FEATURES, WARMUP_DAYS,
 )
 from src.data.news import fetch_news, align_to_trading_days
 from src.data.prices import build_price_frame
+from src.features.dataset import NEUTRAL_SENTIMENT
 from src.features.sentiment import (
     daily_sentiment_frame, finbert_scores_and_embeddings, select_top_news,
     IDX_NEU, IDX_POS, IDX_NEG,
@@ -42,6 +43,16 @@ def load_artifacts(ticker: str) -> dict:
 
     with open(os.path.join(path, 'meta.json')) as f:
         meta = json.load(f)
+
+    # Скейлеры обучены под конкретную постановку задачи: при рассинхроне
+    # с config.STATIONARY_FEATURES прогноз был бы некорректным.
+    expected = 'logret' if STATIONARY_FEATURES else 'price_level'
+    actual = meta.get('target_mode', 'price_level')
+    if actual != expected:
+        raise RuntimeError(
+            f'Артефакты {ticker} обучены в режиме "{actual}", '
+            f'а config.STATIONARY_FEATURES ожидает "{expected}". '
+            f'Переобучите модель: python -m src.train --ticker {ticker}')
 
     return {
         'model': model,
@@ -91,14 +102,28 @@ def predict_next_close(ticker: str, artifacts: dict | None = None) -> dict:
     if df_news.empty:
         raise RuntimeError(f'Нет новостей для {ticker} — проверьте API-ключ')
     df_news = df_news.copy()
-    df_news['date'] = align_to_trading_days(df_news['date'], window.index)
+
+    # Выравнивание на полный торговый индекс, а не на окно: иначе np.clip
+    # в align_to_trading_days отнесёт все новости старше окна к его
+    # первому дню.
+    df_news['date'] = align_to_trading_days(df_news['date'], df_prices.index)
+    df_news = df_news[df_news['date'] >= window.index[0]]
+    if df_news.empty:
+        raise RuntimeError(
+            f'Нет новостей за последние {LOOK_BACK} торговых дней для {ticker}')
 
     sent_daily, emb_daily = daily_sentiment_frame(df_news,
                                                   show_progress=False)
-    sent_daily = (sent_daily.reindex(window.index).ffill().bfill()
-                  .fillna(0.0))
-    emb_daily = (emb_daily.reindex(window.index).ffill().bfill()
-                 .fillna(0.0))
+
+    # Заполнение пропусков совпадает с обучением (см. dataset.py).
+    sent_daily = sent_daily.reindex(window.index).ffill()
+    for col, val in NEUTRAL_SENTIMENT.items():
+        sent_daily[col] = sent_daily[col].fillna(val)
+
+    emb_daily = emb_daily.reindex(window.index).ffill()
+    # начало окна без новостей — первым известным вектором окна;
+    # нулевой эмбеддинг после StandardScaler был бы выбросом
+    emb_daily = emb_daily.bfill()
 
     emb_pc = art['pca'].transform(
         art['emb_scaler'].transform(emb_daily.values))
@@ -112,11 +137,24 @@ def predict_next_close(ticker: str, artifacts: dict | None = None) -> dict:
                       dtype=torch.float32).to(DEVICE)
     with torch.no_grad():
         pred_scaled = art['model'](xp, xe).cpu().numpy()
-    pred = float(art['scaler_y'].inverse_transform(
+    pred_target = float(art['scaler_y'].inverse_transform(
         pred_scaled.reshape(-1, 1))[0, 0])
 
-    last_close = float(window['Close'].iloc[-1])
+    last_close = float(window['raw_Close'].iloc[-1])
     last_date  = window.index[-1]
+
+    if art['meta'].get('target_mode', 'price_level') == 'logret':
+        # модель предсказывает log(Close_{T+1}/Close_T)
+        pred = last_close * float(np.exp(pred_target))
+    else:
+        pred = pred_target
+
+    # источник цен на инференсе должен совпадать с обучением
+    src_now   = df_prices.attrs.get('source', 'unknown')
+    src_train = art['meta'].get('price_source', 'unknown')
+    if src_train != 'unknown' and src_now != src_train:
+        print(f'  ⚠️ Источник цен ({src_now}) не совпадает с источником '
+              f'обучения ({src_train}) — шкала цен может отличаться')
     next_date  = (last_date + pd.tseries.offsets.BDay(1)).date()
 
     return {
@@ -131,7 +169,8 @@ def predict_next_close(ticker: str, artifacts: dict | None = None) -> dict:
             k: round(float(sent_daily[k].iloc[-1]), 3)
             for k in SENTIMENT_FEATURES
         },
-        'window': window,          # DataFrame для графиков в UI
+        'price_source': src_now,
+        'window': window,          # DataFrame для графиков в UI (колонки raw_*)
         'news': df_news,           # сырые новости окна для UI
         'meta': art['meta'],
     }
