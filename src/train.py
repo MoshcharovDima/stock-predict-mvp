@@ -117,7 +117,8 @@ def make_tensors(X: np.ndarray, y: np.ndarray) -> TensorDataset:
                          torch.tensor(y, dtype=torch.float32))
 
 
-def _fit_one_seed(X_seq, y_seq, tr, va, seed: int, verbose: bool = True):
+def _fit_one_seed(X_seq, y_seq, tr, va, seed: int, verbose: bool = True,
+                  use_news: bool = True):
     """Обучает одну модель с заданным сидом. Возвращает (state_dict, история)."""
     set_seed(seed)
 
@@ -128,7 +129,7 @@ def _fit_one_seed(X_seq, y_seq, tr, va, seed: int, verbose: bool = True):
                             batch_size=BATCH_SIZE),
     }
 
-    model = LSTMEmbeddings().to(DEVICE)
+    model = LSTMEmbeddings(use_news=use_news).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = nn.MSELoss()
 
@@ -177,9 +178,9 @@ def _fit_one_seed(X_seq, y_seq, tr, va, seed: int, verbose: bool = True):
     return best_state, history, float(best_val)
 
 
-def _predict_test(state, X_seq, te) -> np.ndarray:
+def _predict_test(state, X_seq, te, use_news: bool = True) -> np.ndarray:
     """Прогноз модели на тестовой части (в шкале скейлера)."""
-    model = LSTMEmbeddings().to(DEVICE)
+    model = LSTMEmbeddings(use_news=use_news).to(DEVICE)
     model.load_state_dict(state)
     model.eval()
     xp, xe = split_streams(X_seq[te], FEATURE_COLS)
@@ -190,7 +191,9 @@ def _predict_test(state, X_seq, te) -> np.ndarray:
         ).cpu().numpy()
 
 
-def train_ticker(ticker: str, seeds: list | None = None) -> dict:
+def train_ticker(ticker: str, seeds: list | None = None,
+                 use_news: bool = True, prebuilt: tuple | None = None,
+                 out_suffix: str = '') -> dict:
     """
     Обучает модель для тикера.
 
@@ -201,9 +204,14 @@ def train_ticker(ticker: str, seeds: list | None = None) -> dict:
     моделью и бенчмарком, поэтому одного прогона недостаточно.
     """
     seeds = seeds or [SEED]
-    print(f'\n{"="*52}\n  Обучение: {ticker}\n{"="*52}')
+    tag = 'гибрид (цены + новости)' if use_news else 'ablation (только цены)'
+    print(f'\n{"="*52}\n  Обучение: {ticker} — {tag}\n{"="*52}')
 
-    df, n_train, n_val, emb_scaler, pca = build_training_frame(ticker)
+    # prebuilt позволяет обучить несколько конфигураций на одном датасете:
+    # FinBERT и выкачка новостей выполняются один раз, сплит идентичен.
+    if prebuilt is None:
+        prebuilt = build_training_frame(ticker)
+    df, n_train, n_val, emb_scaler, pca = prebuilt
     n = len(df)
     print(f'  Датасет: {n} торговых дней '
           f'({df.index[0].date()} → {df.index[-1].date()})')
@@ -243,9 +251,10 @@ def train_ticker(ticker: str, seeds: list | None = None) -> dict:
     runs, best = [], None
     for s in seeds:
         print(f'\n  --- сид {s} ---')
-        state, history, best_val = _fit_one_seed(X_seq, y_seq, tr, va, s)
+        state, history, best_val = _fit_one_seed(X_seq, y_seq, tr, va, s,
+                                                 use_news=use_news)
         pred_target = scaler_y.inverse_transform(
-            _predict_test(state, X_seq, te).reshape(-1, 1)).flatten()
+            _predict_test(state, X_seq, te, use_news).reshape(-1, 1)).flatten()
         y_pred = (close_today * np.exp(pred_target) if STATIONARY_FEATURES
                   else pred_target)
         m = calc_metrics(y_true, y_pred, close_today)
@@ -287,7 +296,7 @@ def train_ticker(ticker: str, seeds: list | None = None) -> dict:
               f'({mae_mean:.3f} >= {naive["MAE"]:.3f})')
 
     # сохранение артефактов
-    out = os.path.join(ARTIFACT_DIR, ticker)
+    out = os.path.join(ARTIFACT_DIR, ticker + out_suffix)
     os.makedirs(out, exist_ok=True)
     torch.save(best['state'], os.path.join(out, 'model.pt'))
     joblib.dump(scaler_X,   os.path.join(out, 'scaler_X.joblib'))
@@ -312,6 +321,7 @@ def train_ticker(ticker: str, seeds: list | None = None) -> dict:
         'trained_at': pd.Timestamp.now().isoformat(timespec='seconds'),
         'period': [str(df.index[0].date()), str(df.index[-1].date())],
         'target_mode': 'logret' if STATIONARY_FEATURES else 'price_level',
+        'use_news': use_news,
         'price_source': df.attrs.get('source', 'unknown'),
         'baseline_up_share': round(up_share, 2),
         'n_days': int(n),
@@ -333,7 +343,60 @@ def train_ticker(ticker: str, seeds: list | None = None) -> dict:
         json.dump(meta, f, indent=2)
 
     print(f'  Артефакты сохранены в {out}')
-    return metrics
+    return {**metrics, '_seed_summary': seed_summary, '_naive': naive,
+            '_up_share': round(up_share, 2)}
+
+
+def ablation_ticker(ticker: str, seeds: list) -> dict:
+    """
+    Ablation «помогают ли новости»: две модели на ОДНОМ датасете —
+    гибрид (цены + эмбеддинги новостей) и та же сеть только с ценовым
+    потоком. Датасет и PCA строятся один раз, поэтому строки, сплит и
+    сиды у обеих конфигураций идентичны, а FinBERT прогоняется однократно.
+
+    Продакшн-артефакты artifacts/{ticker}/ не перезаписываются:
+    результаты идут в {ticker}_hybrid и {ticker}_pricesonly.
+    """
+    print(f'\n{"#"*52}\n  ABLATION: {ticker}\n{"#"*52}')
+    prebuilt = build_training_frame(ticker)
+
+    res = {}
+    for key, use_news, suffix in (('hybrid', True,  '_hybrid'),
+                                  ('prices', False, '_pricesonly')):
+        res[key] = train_ticker(ticker, seeds=seeds, use_news=use_news,
+                                prebuilt=prebuilt, out_suffix=suffix)
+
+    h, p_, naive = res['hybrid'], res['prices'], res['hybrid']['_naive']
+    hs, ps = h['_seed_summary'], p_['_seed_summary']
+
+    print(f'\n{"="*64}\n  ИТОГ ABLATION: {ticker}\n{"="*64}')
+    print(f'  {"":22s} {"MAE":>18s} {"MAPE, %":>16s} {"DA, %":>16s}')
+    for name, sm in (('Гибрид (цены+новости)', hs),
+                     ('Только цены', ps)):
+        print(f'  {name:22s} '
+              f'{sm["MAE"]["mean"]:10.4f} ± {sm["MAE"]["std"]:<5.3f} '
+              f'{sm["MAPE"]["mean"]:9.4f} ± {sm["MAPE"]["std"]:<4.3f} '
+              f'{sm["DA"]["mean"]:9.2f} ± {sm["DA"]["std"]:<4.2f}')
+    print(f'  {"Наивный прогноз":22s} {naive["MAE"]:10.4f} {"":6s} '
+          f'{naive["MAPE"]:9.4f} {"":5s} {"—":>9s}')
+
+    delta = ps['MAE']['mean'] - hs['MAE']['mean']
+    pooled = float(np.sqrt(hs['MAE']['std'] ** 2 + ps['MAE']['std'] ** 2)) or 1e-9
+    print(f'\n  Выигрыш гибрида по MAE: {delta:+.4f} $ '
+          f'({delta / pooled:+.2f} σ разброса по сидам)')
+    if abs(delta) < pooled:
+        print('  Разница меньше разброса между сидами — новостной поток '
+              'не даёт измеримого вклада.')
+
+    summary = {'ticker': ticker, 'seeds': seeds,
+               'hybrid': hs, 'prices_only': ps, 'naive': naive,
+               'up_share': h['_up_share'],
+               'delta_mae': round(delta, 4),
+               'delta_sigma': round(delta / pooled, 3)}
+    with open(os.path.join(ARTIFACT_DIR, f'ablation_{ticker}.json'), 'w') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f'  Сводка: artifacts/ablation_{ticker}.json')
+    return summary
 
 
 if __name__ == '__main__':
@@ -342,12 +405,21 @@ if __name__ == '__main__':
     parser.add_argument('--all', action='store_true')
     parser.add_argument('--seeds', type=int, default=1,
                         help='сколько сидов обучить (для оценки разброса)')
+    parser.add_argument('--ablation', action='store_true',
+                        help='обучить гибрид и модель только на ценах '
+                             'на одном датасете и сравнить')
     args = parser.parse_args()
 
     seed_list = [SEED + i for i in range(max(1, args.seeds))]
     tickers = TICKERS if (args.all or not args.ticker) else [args.ticker]
-    results = {t: train_ticker(t, seeds=seed_list) for t in tickers}
 
-    print(f'\n{"="*52}\n  ИТОГ\n{"="*52}')
-    for t, m in results.items():
-        print(f'  {t}: {m}')
+    if args.ablation:
+        for t in tickers:
+            ablation_ticker(t, seeds=seed_list)
+    else:
+        results = {t: train_ticker(t, seeds=seed_list) for t in tickers}
+        print(f'\n{"="*52}\n  ИТОГ\n{"="*52}')
+        for t, m in results.items():
+            print(f'  {t}: '
+                  + str({k: v for k, v in m.items()
+                         if not k.startswith('_')}))

@@ -5,6 +5,7 @@
 #   Поток 1: цены (batch, 20, 27)      → LSTM(64) → Dropout(0.2)
 #   Поток 2: эмбеддинги (batch, 20, 5) → LSTM(16)
 #   Конкатенация [64 ⊕ 16 = 80] → Dense(32)+ReLU → Dense(1)
+# use_news=False отключает второй поток (ablation «цены без новостей»).
 
 import numpy as np
 import torch
@@ -25,17 +26,21 @@ class LSTMEmbeddings(nn.Module):
                  hidden_price: int = HIDDEN_PRICE,
                  hidden_emb: int = HIDDEN_EMB,
                  dense_hidden: int = DENSE_HIDDEN,
-                 dropout: float = DROPOUT):
+                 dropout: float = DROPOUT,
+                 use_news: bool = True):
         super().__init__()
         self.price_size = price_size
         self.emb_size   = emb_size
+        self.use_news   = use_news
 
         self.lstm_price = nn.LSTM(price_size, hidden_price, batch_first=True)
         self.dropout    = nn.Dropout(dropout)
-        self.lstm_emb   = nn.LSTM(emb_size, hidden_emb, batch_first=True)
+        self.lstm_emb   = (nn.LSTM(emb_size, hidden_emb, batch_first=True)
+                           if use_news else None)
 
+        head_in = hidden_price + (hidden_emb if use_news else 0)
         self.head = nn.Sequential(
-            nn.Linear(hidden_price + hidden_emb, dense_hidden),
+            nn.Linear(head_in, dense_hidden),
             nn.ReLU(),
             nn.Linear(dense_hidden, 1),
         )
@@ -44,6 +49,9 @@ class LSTMEmbeddings(nn.Module):
                 x_emb: torch.Tensor) -> torch.Tensor:
         out_p, _ = self.lstm_price(x_price)
         out_p    = self.dropout(out_p[:, -1, :])       # (batch, 64)
+        if not self.use_news:
+            # ablation: новостной поток отключён, x_emb игнорируется
+            return self.head(out_p).squeeze(-1)
         out_e, _ = self.lstm_emb(x_emb)
         out_e    = out_e[:, -1, :]                     # (batch, 16)
         z = torch.cat([out_p, out_e], dim=1)           # (batch, 80)
