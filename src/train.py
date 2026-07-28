@@ -343,8 +343,7 @@ def train_ticker(ticker: str, seeds: list | None = None,
         json.dump(meta, f, indent=2)
 
     print(f'  Артефакты сохранены в {out}')
-    return {**metrics, '_seed_summary': seed_summary, '_naive': naive,
-            '_up_share': round(up_share, 2)}
+    return metrics
 
 
 def ablation_ticker(ticker: str, seeds: list) -> dict:
@@ -360,14 +359,18 @@ def ablation_ticker(ticker: str, seeds: list) -> dict:
     print(f'\n{"#"*52}\n  ABLATION: {ticker}\n{"#"*52}')
     prebuilt = build_training_frame(ticker)
 
-    res = {}
+    metas = {}
     for key, use_news, suffix in (('hybrid', True,  '_hybrid'),
                                   ('prices', False, '_pricesonly')):
-        res[key] = train_ticker(ticker, seeds=seeds, use_news=use_news,
-                                prebuilt=prebuilt, out_suffix=suffix)
+        train_ticker(ticker, seeds=seeds, use_news=use_news,
+                     prebuilt=prebuilt, out_suffix=suffix)
+        with open(os.path.join(ARTIFACT_DIR, ticker + suffix,
+                               'meta.json')) as f:
+            metas[key] = json.load(f)
 
-    h, p_, naive = res['hybrid'], res['prices'], res['hybrid']['_naive']
-    hs, ps = h['_seed_summary'], p_['_seed_summary']
+    naive = metas['hybrid']['metrics_naive']
+    hs, ps = (metas['hybrid']['seed_summary'],
+              metas['prices']['seed_summary'])
 
     print(f'\n{"="*64}\n  ИТОГ ABLATION: {ticker}\n{"="*64}')
     print(f'  {"":22s} {"MAE":>18s} {"MAPE, %":>16s} {"DA, %":>16s}')
@@ -390,7 +393,7 @@ def ablation_ticker(ticker: str, seeds: list) -> dict:
 
     summary = {'ticker': ticker, 'seeds': seeds,
                'hybrid': hs, 'prices_only': ps, 'naive': naive,
-               'up_share': h['_up_share'],
+               'up_share': metas['hybrid']['baseline_up_share'],
                'delta_mae': round(delta, 4),
                'delta_sigma': round(delta / pooled, 3)}
     with open(os.path.join(ARTIFACT_DIR, f'ablation_{ticker}.json'), 'w') as f:
